@@ -1,159 +1,196 @@
 package client
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"net/url"
-	"strconv"
 	"time"
 
+	"crypto/tls"
+
+	"github.com/sirupsen/logrus"
 	"github.com/suutaku/gobcos/pkg/option"
 )
-
-const (
-	GETE_WAY = "wbbc-dappgetway"
-	MESSAGE  = "message"
-)
-
-type Dapp struct {
-	Token            string `json:"token"`
-	ChainId          string `json:"chainId"`
-	GroupId          string `json:"groupId"`
-	AppId            string `json:"appId"`
-	AppName          string `json:"appName"`
-	IsV3Chain        bool   `json:"isV3Chain"`
-	ChainEncryptType int    `json:"chainEncryptType"`
-}
 
 type Client struct {
 	c        *http.Client
 	dapp     *Dapp
 	host     string
 	bizSeqNo string
+	signUser string
 }
 
 func NewClient(opts ...option.ClientOption) *Client {
 	cOpt := option.PrepareOpts(opts)
 	ret := &Client{
-
-		c:    cOpt.Client,
-		host: cOpt.Host,
+		c:        cOpt.Client,
+		host:     cOpt.Host,
+		signUser: cOpt.SignUser,
 	}
 	if ret.c == nil {
 		ret.c = http.DefaultClient
+		http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
-	response := make(map[string]interface{})
-	err := ret.doRequest(ret.getSaltAddr(), nil, map[string]string{"rand-num": fmt.Sprintf("%v", int32(time.Now().Unix()))}, &response)
+	randNum := int32(time.Now().Unix())
+	salt, err := ret.GetSalt(randNum)
 	if err != nil {
 		panic(err)
 	}
-
-	salt, err := strconv.ParseInt(response["resp"].(string), 10, 32)
-	if err != nil {
+	if _, err := ret.Login(fmt.Sprintf("%v", randNum), salt, cOpt.AppId, cOpt.Appkey); err != nil {
 		panic(err)
 	}
-
-	p2 := map[string]interface{}{
-		"rand-num": salt,
-		"app-id":   cOpt.AppId,
-		"app-key":  cOpt.Appkey,
-	}
-	err = ret.doRequest(ret.loginAddr(), p2, nil, &response)
-	if err != nil {
-		panic(err)
-	}
-
-	tmp, err := json.Marshal(response["resp"])
-	if err != nil {
-		panic(err)
-	}
-	ret.dapp = &Dapp{}
-	err = json.Unmarshal(tmp, ret.dapp)
-	if err != nil {
-		panic(err)
-	}
-	ret.bizSeqNo = response["bizSeqNo"].(string)
 	go func() {
 		for {
 			<-time.After(25 * time.Minute)
-			payload := map[string]interface{}{
-				"access-token": ret.dapp.Token,
-				"exStatus":     "true",
-				"bizSeqNo":     ret.bizSeqNo,
+			if err := ret.UpdateToken(); err != nil {
+				logrus.Error(err)
 			}
-			response := make(map[string]interface{})
-			if err := ret.doRequest(ret.publicRequestAddr(), payload, nil, &response); err != nil {
-				fmt.Println(err)
-				continue
-			}
-			ret.bizSeqNo = response["bizSeqNo"].(string)
 		}
 	}()
 	return ret
 }
-func (c *Client) getSaltAddr() string {
-	ret, err := url.JoinPath(c.host, GETE_WAY, MESSAGE, "getsalt")
+
+func (c *Client) UpdateToken() error {
+	payload := map[string]interface{}{
+		"access-token": c.dapp.Token,
+		"exStatus":     "true",
+		"bizSeqNo":     c.bizSeqNo,
+	}
+	commonResp, err := c.invoke(c.PUBLICREQUEST, payload, nil)
 	if err != nil {
-		panic(err)
-	}
-	return ret
-}
-
-func (c *Client) loginAddr() string {
-	ret, err := url.JoinPath(c.host, GETE_WAY, MESSAGE, "login")
-	if err != nil {
-		panic(err)
-	}
-	return ret
-}
-
-func (c *Client) publicRequestAddr() string {
-	ret, err := url.JoinPath(c.host, GETE_WAY, MESSAGE, "gateway")
-	if err != nil {
-		panic(err)
-	}
-	return ret
-}
-
-func readMessage(r io.Reader) string {
-	tmp := make(map[string]interface{})
-	if err := readPayload(r, tmp); err != nil {
-		return err.Error()
-	}
-	if tmp["message"] != nil {
-		return tmp["message"].(string)
-	}
-	return "unknown message"
-}
-
-func readPayload(r io.Reader, dist interface{}) error {
-	if err := json.NewDecoder(r).Decode(dist); err != nil {
 		return err
 	}
+	c.bizSeqNo = commonResp.BizSeqNo
 	return nil
 }
 
-func (c *Client) doRequest(url string, payload map[string]interface{}, headr map[string]string, dist interface{}) error {
-	buf := bytes.Buffer{}
-	if err := json.NewEncoder(&buf).Encode(payload); err != nil {
-		return err
-	}
-	req, err := http.NewRequest("POST", url, &buf)
+func (c *Client) GetSalt(randNum int32) (string, error) {
+	salt := ""
+	commonResp, err := c.invoke(c.GETSALT, nil, map[string]string{"rand-num": fmt.Sprintf("%v", randNum)})
 	if err != nil {
-		return err
+		return salt, err
 	}
-	for k, v := range headr {
-		req.Header.Add(k, v)
-	}
-	resp, err := c.c.Do(req)
+	err = commonResp.GetPayload(&salt)
+	return salt, err
+}
+
+func (c *Client) Login(randNum, salt, appId, appKey string) (*Dapp, error) {
+
+	encodeKey, err := encryptAES(appKey, salt)
 	if err != nil {
-		return err
+		panic(err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("request faild [%v]: %v", resp.StatusCode, readMessage(resp.Body))
+	p2 := map[string]string{
+		"rand-num": randNum,
+		"app-id":   appId,
+		"app-key":  encodeKey,
 	}
-	return readPayload(resp.Body, dist)
+	commResp, err := c.invoke(c.LOGIN, nil, p2)
+	if err != nil {
+		return nil, err
+	}
+
+	c.dapp = &Dapp{}
+	commResp.GetPayload(c.dapp)
+	c.bizSeqNo = commResp.BizSeqNo
+	return c.dapp, nil
+}
+
+func (c *Client) NewUser(desc string) (*UserResponse, error) {
+	req := UserRequest{SignUserId: c.signUser, Description: desc}
+	pubReq := PublicRequest{ApiName: "newUserApi", Payload: req}
+	cResp, err := c.invoke(c.PUBLICREQUEST, pubReq, c.publicHeader())
+	if err != nil {
+		return nil, err
+	}
+	resp := &UserResponse{}
+	err = cResp.GetPayload(resp)
+	return resp, err
+}
+
+func (c *Client) UserInfo() (*UserResponse, error) {
+	pubReq := PublicRequest{ApiName: "userInfoApi", Payload: c.signUser}
+	cResp, err := c.invoke(c.PUBLICREQUEST, pubReq, c.publicHeader())
+	if err != nil {
+		return nil, err
+	}
+	resp := &UserResponse{}
+	err = cResp.GetPayload(resp)
+	return resp, err
+}
+
+func (c *Client) QueryTransaction(req QueryTransactionRequest) ([]byte, error) {
+	pubReq := PublicRequest{ApiName: "sendQueryTransactionApi", Payload: req}
+	cResp, err := c.invoke(c.PUBLICREQUEST, pubReq, c.publicHeader())
+	if err != nil {
+		return nil, err
+	}
+	resp := make([]byte, 0)
+	err = cResp.GetPayload(resp)
+	return resp, err
+}
+
+func (c *Client) GetTransactionByHash(hash string) (*GetTransactionResponse, error) {
+	pubReq := PublicRequest{ApiName: "getTransactionByHashApi", Payload: hash}
+	cResp, err := c.invoke(c.PUBLICREQUEST, pubReq, c.publicHeader())
+	if err != nil {
+		return nil, err
+	}
+	resp := &GetTransactionResponse{}
+	err = cResp.GetPayload(resp)
+	return resp, err
+}
+
+// func (c *Client) GetTransactionReceipt(hash string) (*GetTransactionByHashResponse, error) {
+// 	pubReq := PublicRequest{ApiName: "getTransactionReceiptApi", Payload: hash}
+// 	cResp, err := c.invoke(c.PUBLICREQUEST, pubReq, c.publicHeader())
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	resp := &GetTransactionByHashResponse{}
+// 	err = cResp.GetPayload(resp)
+// 	return resp, err
+// }
+
+func (c *Client) GetBlockNumber() (int64, error) {
+	pubReq := PublicRequest{ApiName: "getBlockNumber"}
+	cResp, err := c.invoke(c.PUBLICREQUEST, pubReq, c.publicHeader())
+	if err != nil {
+		return 0, err
+	}
+	resp := int64(0)
+	err = cResp.GetPayload(&resp)
+	return resp, err
+}
+
+func (c *Client) Sign(req SignRequest) (*SignResponse, error) {
+	pubReq := PublicRequest{ApiName: "signApi", Payload: req}
+	cResp, err := c.invoke(c.PUBLICREQUEST, pubReq, c.publicHeader())
+	if err != nil {
+		return nil, err
+	}
+	resp := &SignResponse{}
+	err = cResp.GetPayload(&resp)
+	return resp, err
+}
+
+func (c *Client) Deploy(req DeployRequest) (*DeployResponse, error) {
+	pubReq := PublicRequest{ApiName: "deployApi", Payload: req}
+	cResp, err := c.invoke(c.PUBLICREQUEST, pubReq, c.publicHeader())
+	if err != nil {
+		return nil, err
+	}
+	resp := &DeployResponse{}
+	err = cResp.GetPayload(&resp)
+	return resp, err
+}
+
+func (c *Client) SendTransaction(req SendTransactionRequest) (*SendTransactionResponse, error) {
+	pubReq := PublicRequest{ApiName: "sendNewApi", Payload: req}
+	cResp, err := c.invoke(c.PUBLICREQUEST, pubReq, c.publicHeader())
+	if err != nil {
+		return nil, err
+	}
+	resp := &SendTransactionResponse{}
+	err = cResp.GetPayload(&resp)
+	return resp, err
 }

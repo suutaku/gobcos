@@ -3,10 +3,11 @@ package option
 import "net/http"
 
 type clientOption struct {
-	AppId  string
-	Appkey string
-	Client *http.Client
-	Host   string
+	AppId    string
+	Appkey   string
+	Client   *http.Client
+	Host     string
+	SignUser string
 }
 
 type ClientOption func(opts *clientOption)
@@ -32,6 +33,12 @@ func WithAppKey(appKey string) ClientOption {
 func WithHTTPClient(c *http.Client) ClientOption {
 	return func(opts *clientOption) {
 		opts.Client = c
+	}
+}
+
+func WithSignUser(u string) ClientOption {
+	return func(opts *clientOption) {
+		opts.SignUser = u
 	}
 }
 
